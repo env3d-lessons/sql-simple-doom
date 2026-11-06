@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DOOM SQLite Engine - Pure SQL Engine</title>
+  <style>
+    body { background: #111; color: #eee; font-family: monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    canvas { border: 2px solid #555; background: #000; image-rendering: pixelated; }
+    #hud { margin-top: 10px; font-size: 14px; width: 600px; display: flex; justify-content: space-between; }
+    .instructions { color: #888; font-size: 12px; margin-top: 5px; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+</head>
+<body>
+
+  <h2 id="levelTitle">DOOM - Loading Database...</h2>
+  <canvas id="gameCanvas" width="600" height="400"></canvas>
+  <div id="hud">
+    <span id="hp">HEALTH: 100%</span>
+    <span id="weapon">WEAPON: PISTOL</span>
+    <span id="ammo">AMMO: 50</span>
+    <span id="enemies">ENEMIES: 0</span>
+  </div>
+  <div class="instructions">Controls: W/S = Move | A/D = Rotate | SPACE = Shoot | Walk to EXIT portal when clear</div>
+
+<script>
+let db = null;
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const keys = {};
+window.addEventListener('keydown', e => keys[e.code] = true);
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}` }).then(async (SQL) => {
+  try {
+    const response = await fetch('simple_doom.db');
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    
+    const buffer = await response.arrayBuffer();
+    db = new SQL.Database(new Uint8Array(buffer));
+    db.run("PRAGMA foreign_keys = ON;");
+    console.log("Successfully loaded simple_doom.db!");
+    requestAnimationFrame(gameLoop);
+  } catch (err) {
+    console.warn("Could not load simple_doom.db via fetch.", err);
+    alert("Could not load simple_doom.db file.");
+  }
+});
+
+function queryObjects(sql, params = []) {
+  const res = db.exec(sql, params);
+  if (!res.length) return [];
+  const columns = res[0].columns;
+  return res[0].values.map(row => {
+    let obj = {};
+    columns.forEach((col, i) => obj[col] = row[i]);
+    return obj;
+  });
+}
+
+// SQL-driven Obstacle and Boundary Collision Check
+function checkSqlCollision(targetX, targetY, radius) {
+  const result = queryObjects(`
+    SELECT EXISTS (
+      SELECT 1 
+      FROM player p
+      LEFT JOIN obstacles o ON o.level_id = p.current_level_id
+      WHERE p.id = 1
+        AND (
+          ? - ? < 0 OR ? + ? > 600 OR
+          ? - ? < 0 OR ? + ? > 400 OR
+          (? + ? > o.x_pos AND ? - ? < o.x_pos + o.width AND
+           ? + ? > o.y_pos AND ? - ? < o.y_pos + o.height)
+        )
+    ) AS is_blocked;
+  `, [
+    targetX, radius, targetX, radius,
+    targetY, radius, targetY, radius,
+    targetX, radius, targetX, radius,
+    targetY, radius, targetY, radius
+  ]);
+
+  return result[0].is_blocked === 1;
+}
+
+function hasLineOfSight(x1, y1, x2, y2, obstacles) {
+  const dist = Math.hypot(x2 - x1, y2 - y1);
+  const steps = Math.ceil(dist / 5);
+  
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const px = x1 + (x2 - x1) * t;
+    const py = y1 + (y2 - y1) * t;
+    
+    for (let o of obstacles) {
+      if (
+        px >= o.x_pos && 
+        px <= o.x_pos + o.width && 
+        py >= o.y_pos && 
+        py <= o.y_pos + o.height
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function updateGameState(now) {
+  const p = queryObjects("SELECT * FROM player WHERE id = 1")[0];
+  if (!p || p.health <= 0) return;
+
+  const curLevel = queryObjects(`
+    SELECT l.* 
+    FROM levels l 
+    JOIN player p ON l.id = p.current_level_id 
+    WHERE p.id = 1
+  `)[0];
+
+  const obstacles = queryObjects(`
+    SELECT o.* 
+    FROM obstacles o 
+    JOIN player p ON o.level_id = p.current_level_id 
+    WHERE p.id = 1
+  `);
+
+  // --- PLAYER MOVEMENT ---
+  let newDir = p.direction;
+  let move = 0;
+
+  if (keys['KeyA'] || keys['ArrowLeft']) newDir = (newDir - p.turn_speed + 360) % 360;
+  if (keys['KeyD'] || keys['ArrowRight']) newDir = (newDir + p.turn_speed) % 360;
+  if (keys['KeyW'] || keys['ArrowUp']) move = p.move_speed;
+  if (keys['KeyS'] || keys['ArrowDown']) move = -p.move_speed;
+
+  const rad = (newDir * Math.PI) / 180;
+  const dx = Math.cos(rad) * move;
+  const dy = Math.sin(rad) * move;
+
+  const playerRadius = 10;
+  let targetX = p.x_pos + dx;
+  let targetY = p.y_pos + dy;
+
+  let finalX = p.x_pos;
+  let finalY = p.y_pos;
+
+  if (move !== 0) {
+    if (!checkSqlCollision(targetX, p.y_pos, playerRadius)) finalX = targetX;
+    if (!checkSqlCollision(finalX, targetY, playerRadius)) finalY = targetY;
+  }
+
+  // --- MONSTER AI MOVEMENT ---
+  const monsters = queryObjects(`
+    SELECT m.*, mt.move_speed, mt.damage_pct 
+    FROM monsters m
+    JOIN monster_types mt ON m.monster_type_id = mt.id
+    JOIN player p ON m.level_id = p.current_level_id
+    WHERE p.id = 1 AND m.remaining_hp > 0
+  `);
+
+  monsters.forEach(m => {
+    let mDir = m.direction;
+    let lastScan = m.last_scan_time;
+
+    if (now - lastScan >= 1000) {
+      lastScan = now;
+      if (hasLineOfSight(m.x_pos, m.y_pos, finalX, finalY, obstacles)) {
+        const angleToPlayer = Math.atan2(finalY - m.y_pos, finalX - m.x_pos);
+        mDir = (angleToPlayer * 180 / Math.PI + 360) % 360;
+      }
+    }
+
+    const mRad = (mDir * Math.PI) / 180;
+    const mDx = Math.cos(mRad) * m.move_speed;
+    const mDy = Math.sin(mRad) * m.move_speed;
+
+    const monsterRadius = 12;
+    let mTargetX = m.x_pos + mDx;
+    let mTargetY = m.y_pos + mDy;
+
+    let mFinalX = m.x_pos;
+    let mFinalY = m.y_pos;
+
+    if (!checkSqlCollision(mTargetX, m.y_pos, monsterRadius)) {
+      mFinalX = mTargetX;
+    } else {
+      mDir = (mDir + 180) % 360;
+    }
+
+    if (!checkSqlCollision(mFinalX, mTargetY, monsterRadius)) {
+      mFinalY = mTargetY;
+    } else {
+      mDir = (mDir + 180) % 360;
+    }
+
+    db.run(`
+      UPDATE monsters 
+      SET x_pos = ?, y_pos = ?, direction = ?, last_scan_time = ?
+      WHERE id = ?;
+    `, [mFinalX, mFinalY, mDir, lastScan, m.id]);
+  });
+
+  // --- UPDATE PLAYER POSITION ---
+  db.run(`
+    UPDATE player 
+    SET x_pos = ?, y_pos = ?, direction = ?
+    WHERE id = 1;
+  `, [finalX, finalY, newDir]);
+
+  // --- DATABASE MONSTER COLLISION, DAMAGE & BOUNCE CALCULATION ---
+  db.run(`
+    UPDATE player
+    SET 
+      health = MAX(0, health - COALESCE((
+        SELECT SUM(mt.damage_pct)
+        FROM monsters m
+        JOIN monster_types mt ON m.monster_type_id = mt.id
+        WHERE m.level_id = player.current_level_id
+          AND m.remaining_hp > 0
+          AND ABS(m.x_pos - player.x_pos) < 22
+          AND ABS(m.y_pos - player.y_pos) < 22
+      ), 0)),
+      x_pos = MIN(590, MAX(10, x_pos + COALESCE((
+        SELECT SUM(
+          ((player.x_pos - m.x_pos) / MAX(1.0, SQRT((player.x_pos - m.x_pos)*(player.x_pos - m.x_pos) + (player.y_pos - m.y_pos)*(player.y_pos - m.y_pos)))) * 15
+        )
+        FROM monsters m
+        WHERE m.level_id = player.current_level_id
+          AND m.remaining_hp > 0
+          AND ABS(m.x_pos - player.x_pos) < 22
+          AND ABS(m.y_pos - player.y_pos) < 22
+      ), 0))),
+      y_pos = MIN(390, MAX(10, y_pos + COALESCE((
+        SELECT SUM(
+          ((player.y_pos - m.y_pos) / MAX(1.0, SQRT((player.x_pos - m.x_pos)*(player.x_pos - m.x_pos) + (player.y_pos - m.y_pos)*(player.y_pos - m.y_pos)))) * 15
+        )
+        FROM monsters m
+        WHERE m.level_id = player.current_level_id
+          AND m.remaining_hp > 0
+          AND ABS(m.x_pos - player.x_pos) < 22
+          AND ABS(m.y_pos - player.y_pos) < 22
+      ), 0)))
+    WHERE id = 1;
+  `);
+
+  // --- WEAPON PICKUP COLLISION ---
+  const nearbyWeapons = queryObjects(`
+    SELECT w.* 
+    FROM weapons w
+    JOIN player p ON w.level_id = p.current_level_id
+    WHERE p.id = 1 
+      AND ABS(w.x_pos - p.x_pos) < 20 
+      AND ABS(w.y_pos - p.y_pos) < 20
+  `);
+
+  nearbyWeapons.forEach(w => {
+    db.run(`
+      INSERT INTO loadout (player_id, weapon_type_id, ammo_count)
+      VALUES (1, ?, ?)
+      ON CONFLICT(player_id, weapon_type_id) 
+      DO UPDATE SET ammo_count = ammo_count + EXCLUDED.ammo_count;
+    `, [w.weapon_type_id, w.ammo_count]);
+    
+    db.run(`UPDATE player SET active_weapon_type_id = ? WHERE id = 1;`, [w.weapon_type_id]);
+    db.run(`DELETE FROM weapons WHERE id = ?;`, [w.id]);
+  });
+
+  // --- PURE SQL EXIT PORTAL & LEVEL TRANSITION ---
+  db.run(`
+    UPDATE player 
+    SET current_level_id = (
+          SELECT lt.to_level_id 
+          FROM level_transitions lt 
+          WHERE lt.from_level_id = player.current_level_id
+        ),
+        x_pos = 50, 
+        y_pos = 50, 
+        direction = 0
+    WHERE player.id = 1
+      AND (
+        SELECT COUNT(*) 
+        FROM monsters m 
+        WHERE m.level_id = player.current_level_id AND m.remaining_hp > 0
+      ) = 0
+      AND (
+        SELECT ((player.x_pos - l.exit_x)*(player.x_pos - l.exit_x) + (player.y_pos - l.exit_y)*(player.y_pos - l.exit_y))
+        FROM levels l
+        WHERE l.id = player.current_level_id AND l.exit_x IS NOT NULL
+      ) <= 625;
+  `);
+
+  // --- SHOOTING MECHANIC ---
+  if (keys['Space']) {
+    keys['Space'] = false;
+    
+    const loadout = queryObjects(`
+      SELECT l.ammo_count 
+      FROM loadout l
+      JOIN player p ON l.player_id = p.id AND l.weapon_type_id = p.active_weapon_type_id
+      WHERE p.id = 1
+    `)[0];
+    
+    if (loadout && loadout.ammo_count > 0) {
+      db.run(`
+        UPDATE loadout 
+        SET ammo_count = ammo_count - 1 
+        WHERE player_id = 1 
+          AND weapon_type_id = (SELECT active_weapon_type_id FROM player WHERE id = 1);
+      `);
+      
+      const wpn = queryObjects(`
+        SELECT wt.base_damage 
+        FROM weapon_types wt
+        JOIN player p ON wt.id = p.active_weapon_type_id
+        WHERE p.id = 1
+      `)[0];
+
+      const livingMonsters = queryObjects(`
+        SELECT m.id, m.x_pos, m.y_pos 
+        FROM monsters m
+        JOIN player p ON m.level_id = p.current_level_id
+        WHERE p.id = 1 AND m.remaining_hp > 0
+      `);
+
+      livingMonsters.forEach(m => {
+        const mDx = m.x_pos - p.x_pos;
+        const mDy = m.y_pos - p.y_pos;
+        const distSq = mDx * mDx + mDy * mDy;
+        
+        let angleToMonster = (Math.atan2(mDy, mDx) * 180 / Math.PI + 360) % 360;
+        let angleDiff = Math.abs(angleToMonster - p.direction);
+        if (angleDiff > 180) angleDiff = 360 - angleDiff;
+
+        if (distSq < 40000 && angleDiff < 30) {
+          if (hasLineOfSight(p.x_pos, p.y_pos, m.x_pos, m.y_pos, obstacles)) {
+            db.run(`UPDATE monsters SET remaining_hp = MAX(0, remaining_hp - ?) WHERE id = ?;`, [wpn.base_damage, m.id]);
+          }
+        }
+      });
+    }
+  }
+}
+
+function renderEntity(x, y, dirDegrees, radius, bodyColor, pointerColor) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate((dirDegrees * Math.PI) / 180);
+
+  ctx.fillStyle = bodyColor;
+  ctx.beginPath();
+  ctx.arc(0, 0, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = pointerColor;
+  ctx.beginPath();
+  ctx.moveTo(radius, -3);
+  ctx.lineTo(radius + 8, 0);
+  ctx.lineTo(radius, 3);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const p = queryObjects("SELECT * FROM player WHERE id = 1")[0];
+  if (!p) return;
+
+  const curLevel = queryObjects(`
+    SELECT l.* 
+    FROM levels l 
+    JOIN player p ON l.id = p.current_level_id 
+    WHERE p.id = 1
+  `)[0];
+  
+  document.getElementById('levelTitle').innerText = `DOOM - ${curLevel ? curLevel.name : 'Unknown'}`;
+
+  // A. Render Obstacles
+  const obstacles = queryObjects(`
+    SELECT o.* 
+    FROM obstacles o 
+    JOIN player p ON o.level_id = p.current_level_id 
+    WHERE p.id = 1
+  `);
+  ctx.fillStyle = "#444";
+  obstacles.forEach(o => ctx.fillRect(o.x_pos, o.y_pos, o.width, o.height));
+
+  // B. Render Weapons on Ground
+  const weapons = queryObjects(`
+    SELECT w.*, wt.color 
+    FROM weapons w 
+    JOIN weapon_types wt ON w.weapon_type_id = wt.id 
+    JOIN player p ON w.level_id = p.current_level_id
+    WHERE p.id = 1
+  `);
+  weapons.forEach(w => {
+    ctx.fillStyle = w.color;
+    ctx.fillRect(w.x_pos - 6, w.y_pos - 6, 12, 12);
+  });
+
+  // C. Render Monsters
+  const monsters = queryObjects(`
+    SELECT m.*, mt.color 
+    FROM monsters m 
+    JOIN monster_types mt ON m.monster_type_id = mt.id 
+    JOIN player p ON m.level_id = p.current_level_id
+    WHERE p.id = 1 AND m.remaining_hp > 0
+  `);
+  monsters.forEach(m => {
+    renderEntity(m.x_pos, m.y_pos, m.direction, 12, m.color, "#ffffff");
+    ctx.fillStyle = "#ef4444";
+    ctx.fillRect(m.x_pos - 10, m.y_pos - 20, 20, 3);
+    ctx.fillStyle = "#22c55e";
+    ctx.fillRect(m.x_pos - 10, m.y_pos - 20, (m.remaining_hp / 30) * 20, 3);
+  });
+
+  // D. Render Exit Switch Portal
+  if (monsters.length === 0 && curLevel && curLevel.exit_x !== null) {
+    ctx.fillStyle = "#3b82f6";
+    ctx.beginPath();
+    ctx.arc(curLevel.exit_x, curLevel.exit_y, 15, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "10px monospace";
+    ctx.fillText("EXIT", curLevel.exit_x - 11, curLevel.exit_y + 3);
+  }
+
+  // E. Render Doomguy
+  if (p.health > 0) {
+    renderEntity(p.x_pos, p.y_pos, p.direction, 10, "#22c55e", "#facc15");
+    
+    // F. Draw Aim Line
+    const rad = (p.direction * Math.PI) / 180;
+    ctx.strokeStyle = "rgba(250, 204, 21, 0.2)";
+    ctx.beginPath();
+    ctx.moveTo(p.x_pos, p.y_pos);
+    ctx.lineTo(p.x_pos + Math.cos(rad) * 150, p.y_pos + Math.sin(rad) * 150);
+    ctx.stroke();
+  }
+
+  // G. Update HUD
+  const hudData = queryObjects(`
+    SELECT wt.name AS weapon_name, l.ammo_count
+    FROM player p
+    JOIN weapon_types wt ON p.active_weapon_type_id = wt.id
+    LEFT JOIN loadout l ON p.id = l.player_id AND wt.id = l.weapon_type_id
+    WHERE p.id = 1
+  `)[0];
+
+  document.getElementById('hp').innerText = `HEALTH: ${p.health}%`;
+  document.getElementById('weapon').innerText = `WEAPON: ${hudData ? hudData.weapon_name.toUpperCase() : 'NONE'}`;
+  document.getElementById('ammo').innerText = `AMMO: ${hudData ? hudData.ammo_count : 0}`;
+  document.getElementById('enemies').innerText = `ENEMIES: ${monsters.length}`;
+
+  // Game Over / Victory Overlays
+  if (p.health <= 0) {
+    ctx.fillStyle = "#ef4444";
+    ctx.font = "32px monospace";
+    ctx.fillText("YOU DIED!", 220, 200);
+  } else {
+    const hasTransitions = queryObjects(`
+      SELECT lt.* 
+      FROM level_transitions lt
+      JOIN player p ON lt.from_level_id = p.current_level_id
+      WHERE p.id = 1
+    `);
+    if (monsters.length === 0 && hasTransitions.length === 0) {
+      ctx.fillStyle = "#facc15";
+      ctx.font = "28px monospace";
+      ctx.fillText("ALL LEVELS CLEARED!", 150, 200);
+    }
+  }
+}
+
+function gameLoop(timestamp) {
+  if (db) {
+    updateGameState(timestamp);
+    render();
+  }
+  requestAnimationFrame(gameLoop);
+}
+</script>
+</body>
+</html>
